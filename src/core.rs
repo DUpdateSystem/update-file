@@ -1,22 +1,24 @@
-use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string};
 use std::fs;
+use std::path::Path;
 use std::{collections::HashMap, io};
 
 use crate::python::*;
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct OperationData<'a> {
-    data_map: &'a HashMap<String, String>,
-    full_content: &'a str,
-    remaining_content: &'a str,
+    pub data_map: &'a HashMap<String, String>,
+    pub full_content: &'a str,
+    pub content_index: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Debug, PartialEq)]
 pub struct OperationOutput {
-    data_map: HashMap<String, String>,
-    processed_content: String,
+    pub data_map: HashMap<String, String>,
+    pub content_index: usize,
+    pub new_content: String,
+    pub error_message: String,
 }
 
 pub struct Operation {
@@ -32,16 +34,25 @@ impl Operation {
         }
     }
 
-    fn read_opt_content(&self) -> String {
+    fn get_opt_content(&self) -> String {
         let file_path = format!("{}/opt-{}.py", self.opt_dir_path, self.id);
         let opt_content = fs::read(file_path).unwrap();
         String::from_utf8(opt_content).unwrap()
     }
 
+    fn read_opt_content(&self) -> String {
+        let content = self.get_opt_content();
+        create_operation_runner_python(&content)
+    }
+
     fn write_opt_content(&self, user_content: &str) -> bool {
         let file_path = format!("{}/opt-{}.py", self.opt_dir_path, self.id);
-        let content = get_operation_python(user_content);
-        if content.is_empty() || !content.contains("class Operation") {
+        let content = if let Ok(content) = get_operation_python(user_content) {
+            content
+        } else {
+            return false;
+        };
+        if content.is_empty() {
             return false;
         }
         fs::write(file_path, content).unwrap();
@@ -66,20 +77,28 @@ impl Operation {
         fs::remove_file(file_path).is_ok()
     }
 
-    fn process(&self, data: OperationData) -> Result<OperationOutput, io::Error> {
-        let code = self.read_opt_content();
-        let data_str = to_string(data.data_map).unwrap();
+    fn process(&self, data: &OperationData) -> Result<OperationOutput, io::Error> {
+        let code = self.get_opt_content();
+        let data_str = to_string(data).unwrap();
         let output_str = run_operation_python(&code, &data_str)?;
-        let output: OperationOutput = from_str(&output_str).unwrap();
-        Ok(output)
+        let rlt = from_str(&output_str);
+        match rlt {
+            Ok(output) => Ok(output),
+            Err(e) => Ok(OperationOutput {
+                data_map: data.data_map.clone(),
+                new_content: "".to_string(),
+                content_index: data.content_index,
+                error_message: e.to_string(),
+            }),
+        }
     }
 
     fn get_templete(&self) -> String {
-        get_operation_temple_python()
+        get_operation_temple_python(None)
     }
 
     fn equals(&self, other: &Operation) -> bool {
-        self.read_opt_content() == other.read_opt_content()
+        self.get_opt_content() == other.get_opt_content()
     }
 }
 
@@ -118,15 +137,15 @@ impl OperationManager {
         &mut self,
         id: u32,
         full_content: &str,
-        remaining_content: &str,
+        content_index: usize,
     ) -> Result<OperationOutput, io::Error> {
         let opt = Operation::new(id, &self.opt_dir_path);
         let data = OperationData {
             data_map: &self.data_map,
             full_content,
-            remaining_content,
+            content_index,
         };
-        let output = opt.process(data)?;
+        let output = opt.process(&data)?;
         self.data_map = output.data_map.clone();
         Ok(output)
     }
@@ -136,33 +155,18 @@ impl OperationManager {
         stop_id: u32,
         full_content: &str,
     ) -> Vec<Result<OperationOutput, io::Error>> {
-        let mut remaining_content = full_content;
+        let mut content_index = 0;
         let mut outputs = Vec::new();
         let ids = self.get_ids();
         for id in 0..stop_id {
             if !ids.contains(&id) {
                 break;
             }
-            let opt = Operation::new(id, &self.opt_dir_path);
-            let data = OperationData {
-                data_map: &self.data_map,
-                full_content,
-                remaining_content,
-            };
-            let output = opt.process(data);
+            let output = self.run_operation(id, full_content, content_index);
             match output {
                 Ok(ref output) => {
                     self.data_map = output.data_map.clone();
-                    let processed_content = output.processed_content.clone();
-                    if remaining_content[0..processed_content.len()] == processed_content {
-                        remaining_content = &remaining_content[processed_content.len()..];
-                    } else {
-                        outputs.push(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "Processed content is not in the beginning of the remaining content",
-                        )));
-                        break;
-                    }
+                    content_index = output.content_index;
                 }
                 Err(e) => {
                     outputs.push(Err(e));
@@ -221,7 +225,7 @@ impl OperationManager {
             return true;
         }
 
-        let mut new_id  = opt_ids.len() as u32;
+        let mut new_id = opt_ids.len() as u32;
         for id in opt_ids.iter().rev() {
             let mut opt = Operation::new(*id, &self.opt_dir_path);
             opt.rename_opt_content(new_id);
@@ -249,9 +253,12 @@ mod tests {
         let opt = Operation::new(0, opt_dir_path);
 
         // write operation content
-        let user_content = get_operation_temple_python() + "\nprint('Hello, World!')\n";
+        let user_content = get_operation_temple_python(None) + "\nprint('Hello, World!')\n";
         assert!(opt.write_opt_content(&user_content));
-        assert_eq!(opt.read_opt_content(), get_operation_python(&user_content));
+        assert_eq!(
+            opt.get_opt_content(),
+            get_operation_python(&user_content).unwrap()
+        );
     }
 
     #[test]
@@ -264,13 +271,13 @@ mod tests {
         let mut opt = Operation::new(0, opt_dir_path);
 
         // write operation content
-        let user_content = &get_operation_temple_python();
+        let user_content = &get_operation_temple_python(None);
         assert!(opt.write_opt_content(user_content));
-        let file_content = get_operation_python(user_content);
+        let file_content = get_operation_python(user_content).unwrap();
 
         // rename operation content
         assert!(opt.rename_opt_content(1));
-        assert_eq!(opt.read_opt_content(), file_content);
+        assert_eq!(opt.get_opt_content(), file_content);
         let file_path = format!("{}/opt-1.py", opt_dir_path);
         let file_old_path = format!("{}/opt-0.py", opt_dir_path);
         assert!(Path::new(&file_path).exists());
@@ -287,14 +294,14 @@ mod tests {
         // create OperationManager instance
         let mut manager = OperationManager::new(opt_dir_path);
 
-        let user_content = &get_operation_temple_python();
+        let user_content = &get_operation_temple_python(None);
         // create Operation instance
         let opt1 = manager.insert_operation(1).unwrap();
-        opt1.write_opt_content(user_content);
+        assert!(opt1.write_opt_content(user_content));
         let opt2 = manager.insert_operation(2).unwrap();
-        opt2.write_opt_content(user_content);
+        assert!(opt2.write_opt_content(user_content));
         let opt3 = manager.insert_operation(3).unwrap();
-        opt3.write_opt_content(user_content);
+        assert!(opt3.write_opt_content(user_content));
 
         // check operation count and operation ID
         assert_eq!(manager.get_ids().len(), 3);
@@ -319,7 +326,7 @@ mod tests {
         // create OperationManager instance
         let mut manager = OperationManager::new(opt_dir_path);
 
-        let user_content = &get_operation_temple_python();
+        let user_content = &get_operation_temple_python(None);
         // create Operation instance
         let opt1 = manager.insert_operation(1).unwrap();
         opt1.write_opt_content(user_content);
@@ -338,5 +345,23 @@ mod tests {
         // check operation count and operation ID
         let ids = manager.get_ids();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_manager_run_operation() {
+        let opt_dir_path = "./src/tests";
+
+        // create OperationManager instance
+        let mut manager = OperationManager::new(opt_dir_path);
+
+        // run operation
+        let full_content = "Hello, World!";
+        let output = manager.run_operation(1, full_content, 0).unwrap();
+        assert_eq!(output.error_message, "");
+        assert_eq!(output.content_index, 0);
+        let output = manager.run_operation(2, full_content, 0).unwrap();
+        assert_eq!(output.error_message, "");
+        assert_eq!(output.content_index, full_content.len());
+        assert!(!output.new_content.is_empty())
     }
 }
