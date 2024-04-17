@@ -57,6 +57,7 @@ raise NotImplementedError("Please implement the operation block")
 ## Collect data start
 from json import dumps
 from dataclasses import asdict
+from os import environ
 
 output = OperationOutput(
     data_map=data_map,
@@ -65,5 +66,7 @@ output = OperationOutput(
     error_message=error_message,
 )
 json = dumps(asdict(output))
-print(json)
+output_path = environ.get("OUTPUT_FILE", "/dev/stdout")
+with open(output_path, "w") as f:
+    f.write(json)
 ## Collect data end
